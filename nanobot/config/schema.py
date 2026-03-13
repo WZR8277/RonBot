@@ -293,10 +293,10 @@ class WebSearchConfig(Base):
 
 
 class WebToolsConfig(Base):
-    """Web tools configuration."""
+    """Web tools configuration. Proxy here applies only to web_search, web_fetch, frontier_ingest — not to LLM (e.g. Dashscope)."""
 
     proxy: str | None = (
-        None  # HTTP/SOCKS5 proxy URL, e.g. "http://127.0.0.1:7890" or "socks5://127.0.0.1:1080"
+        None  # HTTP/SOCKS5 for web tools only. e.g. "http://127.0.0.1:7890". Do NOT set HTTP_PROXY env or LLM may fail.
     )
     search: WebSearchConfig = Field(default_factory=WebSearchConfig)
 

@@ -4,11 +4,12 @@ import asyncio
 import json
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from nanobot.agent.tools.frontier import SummarizeTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
@@ -16,6 +17,9 @@ from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import ExecToolConfig
 from nanobot.providers.base import LLMProvider
+
+if TYPE_CHECKING:
+    from nanobot.config.schema import RAGConfig
 
 
 class SubagentManager:
@@ -34,10 +38,11 @@ class SubagentManager:
         web_proxy: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
+        rag_config: "RAGConfig | None" = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.provider = provider
-        self.workspace = workspace
+        self.workspace = Path(workspace)
         self.bus = bus
         self.model = model or provider.get_default_model()
         self.temperature = temperature
@@ -47,6 +52,7 @@ class SubagentManager:
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
+        self._rag_config = rag_config
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
 
@@ -96,7 +102,9 @@ class SubagentManager:
             # Build subagent tools (no message tool, no spawn tool)
             tools = ToolRegistry()
             allowed_dir = self.workspace if self.restrict_to_workspace else None
-            tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
+            tools.register(ReadFileTool(
+                workspace=self.workspace, allowed_dir=allowed_dir, max_tokens=self.max_tokens
+            ))
             tools.register(WriteFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
             tools.register(EditFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
             tools.register(ListDirTool(workspace=self.workspace, allowed_dir=allowed_dir))
@@ -108,7 +116,9 @@ class SubagentManager:
             ))
             tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
             tools.register(WebFetchTool(proxy=self.web_proxy))
-            
+            tools.register(SummarizeTool(provider=self.provider, model=self.model))
+            self._register_rag_tools(tools)
+
             system_prompt = self._build_subagent_prompt()
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
@@ -176,6 +186,48 @@ class SubagentManager:
             error_msg = f"Error: {str(e)}"
             logger.error("Subagent [{}] failed: {}", task_id, e)
             await self._announce_result(task_id, label, task, error_msg, origin, "error")
+
+    def _register_rag_tools(self, tools: ToolRegistry) -> None:
+        """Register RAG tools when enabled, so subagents can run correction/summary modules with knowledge_base."""
+        rag = self._rag_config
+        if not rag or not getattr(rag, "enabled", True):
+            return
+        try:
+            from nanobot.agent.tools.rag import RAGIndexTool, RAGQueryDedupTool, RAGQueryTool, RagEnsureInitializedTool
+        except ImportError:
+            return
+        persist_dir = self.workspace / "memory" / "rag"
+        api_key = getattr(rag, "api_key", "") or ""
+        embedding_model = getattr(rag, "embedding_model", "") or ""
+        kb_subdir = getattr(rag, "knowledge_base_subdir", "knowledge_base") or "knowledge_base"
+        tools.register(RagEnsureInitializedTool(
+            workspace=self.workspace,
+            knowledge_base_subdir=kb_subdir,
+            embedding_api_key=api_key,
+            embedding_model=embedding_model,
+            persist_dir=persist_dir,
+        ))
+        tools.register(RAGIndexTool(
+            workspace=self.workspace,
+            knowledge_base_subdir=kb_subdir,
+            embedding_api_key=api_key,
+            embedding_model=embedding_model,
+            persist_dir=persist_dir,
+        ))
+        tools.register(RAGQueryTool(
+            workspace=self.workspace,
+            knowledge_base_subdir=kb_subdir,
+            embedding_api_key=api_key,
+            embedding_model=embedding_model,
+            persist_dir=persist_dir,
+        ))
+        tools.register(RAGQueryDedupTool(
+            workspace=self.workspace,
+            knowledge_base_subdir=kb_subdir,
+            embedding_api_key=api_key,
+            embedding_model=embedding_model,
+            persist_dir=persist_dir,
+        ))
 
     async def _announce_result(
         self,

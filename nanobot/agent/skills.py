@@ -59,6 +59,7 @@ class SkillsLoader:
     def load_skill(self, name: str) -> str | None:
         """
         Load a skill by name.
+        Workspace skills override built-in: workspace/skills/<name>/SKILL.md is used if present.
 
         Args:
             name: Skill name (directory name).
@@ -66,15 +67,19 @@ class SkillsLoader:
         Returns:
             Skill content or None if not found.
         """
-        # Check workspace first
+        from loguru import logger
+
+        # Check workspace first (overrides builtin)
         workspace_skill = self.workspace_skills / name / "SKILL.md"
         if workspace_skill.exists():
+            logger.info("Skill {} loaded from workspace: {}", name, workspace_skill)
             return workspace_skill.read_text(encoding="utf-8")
 
         # Check built-in
         if self.builtin_skills:
             builtin_skill = self.builtin_skills / name / "SKILL.md"
             if builtin_skill.exists():
+                logger.info("Skill {} loaded from builtin: {}", name, builtin_skill)
                 return builtin_skill.read_text(encoding="utf-8")
 
         return None

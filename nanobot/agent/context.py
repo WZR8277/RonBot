@@ -10,6 +10,7 @@ from typing import Any
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
+from nanobot.agent.token_utils import tokens_to_chars
 from nanobot.utils.helpers import detect_image_mime
 
 
@@ -36,9 +37,30 @@ class ContextBuilder:
         if memory:
             parts.append(f"# Memory\n\n{memory}")
 
+        # Mandatory skill(s) for this request: inject full content so the model MUST follow it
+        if skill_names:
+            mandatory_content = self.skills.load_skills_for_context(skill_names)
+            if mandatory_content:
+                strict_note = (
+                    "For this task, you MUST execute the steps in order. "
+                    "After each step, your next response MUST be the required tool call(s), not a natural-language summary or closing — "
+                    "**except where the skill asks you to output analysis or conclusion first** (e.g. 步骤 3 读摘要并调用 RAG；步骤 4.2 去重判断有无新进展 — **无新进展**才 message 结束，**有新进展时禁止 message**，直接进入 4.3；4.3 先 rag_query 全量再订正，须先在回复中输出订正结论与带【可靠】/【待验证】的订正正文，再 write_file). "
+                    "Do not skip steps; do not repeat an earlier step (e.g. do not call frontier_ingest again after step 1). "
+                    "Continue until the final step (message) is sent.\n\n"
+                )
+                parts.append(
+                    "# Mandatory skill for this task\n\n"
+                    + strict_note
+                    + f"{mandatory_content}"
+                )
+
         always_skills = self.skills.get_always_skills()
-        if always_skills:
-            always_content = self.skills.load_skills_for_context(always_skills)
+        skip = set(skill_names or [])
+        always_skills_to_load = [s for s in always_skills] if always_skills else []
+        if skip:
+            always_skills_to_load = [s for s in (always_skills or []) if s not in skip]
+        if always_skills_to_load:
+            always_content = self.skills.load_skills_for_context(always_skills_to_load)
             if always_content:
                 parts.append(f"# Active Skills\n\n{always_content}")
 
@@ -97,13 +119,19 @@ Your workspace is at: {workspace_path}
 Reply directly with text for conversations. Only use the 'message' tool to send to a specific chat channel."""
 
     @staticmethod
-    def _build_runtime_context(channel: str | None, chat_id: str | None) -> str:
+    def _build_runtime_context(
+        channel: str | None = None,
+        chat_id: str | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
         """Build untrusted runtime metadata block for injection before the user message."""
         now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
         tz = time.strftime("%Z") or "UTC"
         lines = [f"Current Time: {now} ({tz})"]
         if channel and chat_id:
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
+        if max_tokens is not None and max_tokens > 0:
+            lines.append(f"Max response tokens for this session: {max_tokens} — keep single-turn input+output within this limit.")
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 
     def _load_bootstrap_files(self) -> str:
@@ -126,9 +154,10 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         media: list[str] | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
+        max_tokens: int | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
-        runtime_ctx = self._build_runtime_context(channel, chat_id)
+        runtime_ctx = self._build_runtime_context(channel, chat_id, max_tokens)
         user_content = self._build_user_content(current_message, media)
 
         # Merge runtime context and user content into a single user message
@@ -167,11 +196,20 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         return images + [{"type": "text", "text": text}]
 
     def add_tool_result(
-        self, messages: list[dict[str, Any]],
-        tool_call_id: str, tool_name: str, result: str,
+        self,
+        messages: list[dict[str, Any]],
+        tool_call_id: str,
+        tool_name: str,
+        result: str,
+        max_tokens: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Add a tool result to the message list."""
-        messages.append({"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result})
+        """Add a tool result to the message list. If max_tokens is set, truncate result to fit token budget."""
+        content = result
+        if max_tokens and max_tokens > 0:
+            max_chars = tokens_to_chars(max_tokens // 2)  # reserve half for one result
+            if len(content) > max_chars:
+                content = content[:max_chars] + f"\n\n... (truncated to fit {max_tokens} token context)"
+        messages.append({"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": content})
         return messages
 
     def add_assistant_message(

@@ -51,6 +51,7 @@ rag = [
     "chromadb>=0.4.0,<1.0.0",
     "rank_bm25>=0.2.2,<1.0.0",
     "sentence-transformers>=2.2.0,<3.0.0",
+    "posthog>=2.4.0,<6.0.0",
 ]
 matrix = [
     "matrix-nio[e2e]>=0.25.2",

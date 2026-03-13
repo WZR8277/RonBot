@@ -4,6 +4,7 @@ import difflib
 from pathlib import Path
 from typing import Any
 
+from nanobot.agent.token_utils import tokens_to_chars
 from nanobot.agent.tools.base import Tool
 
 
@@ -24,13 +25,24 @@ def _resolve_path(
 
 
 class ReadFileTool(Tool):
-    """Tool to read file contents."""
+    """Tool to read file contents. Caps returned length by max_tokens so one result doesn't exceed context."""
 
-    _MAX_CHARS = 128_000  # ~128 KB — prevents OOM from reading huge files into LLM context
+    _MAX_CHARS_ABSOLUTE = 128_000  # hard cap
 
-    def __init__(self, workspace: Path | None = None, allowed_dir: Path | None = None):
+    def __init__(
+        self,
+        workspace: Path | None = None,
+        allowed_dir: Path | None = None,
+        max_tokens: int | None = None,
+    ):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
+        # Reserve at most half of context for one read result (rest for system, history, output)
+        self._max_chars = (
+            min(self._MAX_CHARS_ABSOLUTE, tokens_to_chars(max_tokens // 2))
+            if max_tokens and max_tokens > 0
+            else self._MAX_CHARS_ABSOLUTE
+        )
 
     @property
     def name(self) -> str:
@@ -57,15 +69,15 @@ class ReadFileTool(Tool):
                 return f"Error: Not a file: {path}"
 
             size = file_path.stat().st_size
-            if size > self._MAX_CHARS * 4:  # rough upper bound (UTF-8 chars ≤ 4 bytes)
+            if size > self._max_chars * 4:  # rough upper bound (UTF-8 chars ≤ 4 bytes)
                 return (
                     f"Error: File too large ({size:,} bytes). "
                     f"Use exec tool with head/tail/grep to read portions."
                 )
 
             content = file_path.read_text(encoding="utf-8")
-            if len(content) > self._MAX_CHARS:
-                return content[: self._MAX_CHARS] + f"\n\n... (truncated — file is {len(content):,} chars, limit {self._MAX_CHARS:,})"
+            if len(content) > self._max_chars:
+                return content[: self._max_chars] + f"\n\n... (truncated — file is {len(content):,} chars, limit {self._max_chars:,} to fit context tokens)"
             return content
         except PermissionError as e:
             return f"Error: {e}"
@@ -74,7 +86,7 @@ class ReadFileTool(Tool):
 
 
 class WriteFileTool(Tool):
-    """Tool to write content to a file."""
+    """Tool to write content to a file. Supports overwrite (default) or append."""
 
     def __init__(self, workspace: Path | None = None, allowed_dir: Path | None = None):
         self._workspace = workspace
@@ -86,7 +98,11 @@ class WriteFileTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Write content to a file at the given path. Creates parent directories if needed."
+        return (
+            "Write content to a file at the given path. Creates parent directories if needed. "
+            "Use append=true to append to the end of the file (e.g. for knowledge_base/facts.md); "
+            "otherwise the file is overwritten."
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -95,14 +111,25 @@ class WriteFileTool(Tool):
             "properties": {
                 "path": {"type": "string", "description": "The file path to write to"},
                 "content": {"type": "string", "description": "The content to write"},
+                "append": {
+                    "type": "boolean",
+                    "description": "If true, append content to the end of the file (do not overwrite). Use for facts.md.",
+                    "default": False,
+                },
             },
             "required": ["path", "content"],
         }
 
-    async def execute(self, path: str, content: str, **kwargs: Any) -> str:
+    async def execute(self, path: str, content: str, append: bool = False, **kwargs: Any) -> str:
         try:
             file_path = _resolve_path(path, self._workspace, self._allowed_dir)
             file_path.parent.mkdir(parents=True, exist_ok=True)
+            if append:
+                with file_path.open("a", encoding="utf-8") as f:
+                    if file_path.exists() and file_path.stat().st_size > 0:
+                        f.write("\n\n")
+                    f.write(content)
+                return f"Successfully appended {len(content)} bytes to {file_path}"
             file_path.write_text(content, encoding="utf-8")
             return f"Successfully wrote {len(content)} bytes to {file_path}"
         except PermissionError as e:

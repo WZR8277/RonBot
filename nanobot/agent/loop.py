@@ -17,6 +17,7 @@ from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from nanobot.agent.tools.frontier import FrontierIngestTool, SummarizeTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
@@ -99,6 +100,7 @@ class AgentLoop:
             web_proxy=web_proxy,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
+            rag_config=rag_config,
         )
 
         self._rag_config = rag_config
@@ -117,7 +119,10 @@ class AgentLoop:
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         allowed_dir = self.workspace if self.restrict_to_workspace else None
-        for cls in (ReadFileTool, WriteFileTool, EditFileTool, ListDirTool):
+        self.tools.register(ReadFileTool(
+            workspace=self.workspace, allowed_dir=allowed_dir, max_tokens=self.max_tokens
+        ))
+        for cls in (WriteFileTool, EditFileTool, ListDirTool):
             self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
         self.tools.register(ExecTool(
             working_dir=str(self.workspace),
@@ -127,6 +132,12 @@ class AgentLoop:
         ))
         self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
+        self.tools.register(FrontierIngestTool(
+            workspace=self.workspace,
+            api_key=self.brave_api_key,
+            proxy=self.web_proxy,
+        ))
+        self.tools.register(SummarizeTool(provider=self.provider, model=self.model))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
@@ -139,13 +150,20 @@ class AgentLoop:
         if not rag or not getattr(rag, "enabled", True):
             return
         try:
-            from nanobot.agent.tools.rag import RAGIndexTool, RAGQueryTool
+            from nanobot.agent.tools.rag import RAGIndexTool, RAGQueryDedupTool, RAGQueryTool, RagEnsureInitializedTool
         except ImportError:
             return
         persist_dir = self.workspace / "memory" / "rag"
         api_key = getattr(rag, "api_key", "") or ""
         embedding_model = getattr(rag, "embedding_model", "") or ""
         kb_subdir = getattr(rag, "knowledge_base_subdir", "knowledge_base") or "knowledge_base"
+        self.tools.register(RagEnsureInitializedTool(
+            workspace=self.workspace,
+            knowledge_base_subdir=kb_subdir,
+            embedding_api_key=api_key,
+            embedding_model=embedding_model,
+            persist_dir=persist_dir,
+        ))
         self.tools.register(RAGIndexTool(
             workspace=self.workspace,
             knowledge_base_subdir=kb_subdir,
@@ -154,6 +172,13 @@ class AgentLoop:
             persist_dir=persist_dir,
         ))
         self.tools.register(RAGQueryTool(
+            workspace=self.workspace,
+            knowledge_base_subdir=kb_subdir,
+            embedding_api_key=api_key,
+            embedding_model=embedding_model,
+            persist_dir=persist_dir,
+        ))
+        self.tools.register(RAGQueryDedupTool(
             workspace=self.workspace,
             knowledge_base_subdir=kb_subdir,
             embedding_api_key=api_key,
@@ -198,6 +223,38 @@ class AgentLoop:
         return re.sub(r"<think>[\s\S]*?</think>", "", text).strip() or None
 
     @staticmethod
+    def _is_frontier_request(content: str) -> bool:
+        """True if the user/cron message asks for agent-frontier (前沿周报). Used to inject full SKILL into system prompt."""
+        if not content or not isinstance(content, str):
+            return False
+        c = content.strip()
+        return (
+            "agent-frontier" in c
+            or "前沿周报" in c
+            or ("前沿" in c and "周报" in c)
+        )
+
+    @staticmethod
+    def _is_likely_frontier_task(messages: list[dict]) -> bool:
+        """Heuristic: current task is agent-frontier (前沿周报). Used only for max_iterations override; flow is defined in skill."""
+        if not messages:
+            return False
+        text_parts: list[str] = []
+        for m in messages:
+            role = m.get("role")
+            content = m.get("content")
+            if role == "system" and isinstance(content, str):
+                text_parts.append(content)
+            if role == "user" and isinstance(content, str):
+                text_parts.append(content)
+        combined = "\n".join(text_parts)
+        return (
+            "agent-frontier" in combined
+            or "前沿周报" in combined
+            or ("前沿" in combined and "周报" in combined)
+        )
+
+    @staticmethod
     def _tool_hint(tool_calls: list) -> str:
         """Format tool calls as concise hint, e.g. 'web_search("query")'."""
         def _fmt(tc):
@@ -208,18 +265,62 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    @staticmethod
+    def _frontier_step_label(tools_used: list[str], tool_calls: list) -> str:
+        """Infer agent-frontier step (0..7) from current tool calls for progress log only. Returns e.g. '步骤 3/7' or ''."""
+        if not tool_calls:
+            return ""
+        names = [getattr(tc, "name", None) for tc in tool_calls]
+        names = [n for n in names if n]
+        path = ""
+        for tc in tool_calls:
+            args = getattr(tc, "arguments", None)
+            if isinstance(args, dict) and "path" in args:
+                path = (args.get("path") or "").lower()
+                break
+            if isinstance(args, list) and args and isinstance(args[0], dict):
+                path = (args[0].get("path") or "").lower()
+                break
+        if "rag_ensure_initialized" in names:
+            return "步骤 0/7"
+        if "frontier_ingest" in names:
+            return "步骤 1/7"
+        if "read_file" in names and ("rag_query" in names or "rag_query_dedup" in names):
+            return "步骤 3/7"
+        if "write_file" in names:
+            if "corrected" in path:
+                return "步骤 4.3/7"
+            if "summary" in path or "summar" in path:
+                return "步骤 2/7"
+            if any(x in path for x in ("facts", "uncertain")):
+                return "步骤 5/7"
+        if "read_file" in names and ("summary" in path or "summar" in path) and "rag_query_dedup" in tools_used:
+            return "步骤 4.1/7"
+        if "summarize" in names:
+            return "步骤 2/7"
+        if "read_file" in names and "frontier_ingest" in tools_used and "rag_query" not in names and "rag_query_dedup" not in names:
+            return "步骤 2/7"
+        if "rag_index" in names:
+            return "步骤 6/7"
+        if "message" in names:
+            return "步骤 7/7" if "rag_index" in tools_used else "步骤 4.2/7"
+        return ""
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
+        max_iterations_override: int | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        max_iter = max_iterations_override if max_iterations_override is not None else self.max_iterations
+        is_frontier = self._is_likely_frontier_task(initial_messages)
 
-        while iteration < self.max_iterations:
+        while iteration < max_iter:
             iteration += 1
 
             response = await self.provider.chat(
@@ -232,11 +333,18 @@ class AgentLoop:
             )
 
             if response.has_tool_calls:
+                current_tool_names = [tc.name for tc in response.tool_calls]
+                step_prefix = ""
+                if on_progress and is_frontier:
+                    lbl = self._frontier_step_label(tools_used, response.tool_calls)
+                    if lbl:
+                        step_prefix = f"[{lbl}] "
                 if on_progress:
                     thought = self._strip_think(response.content)
                     if thought:
-                        await on_progress(thought)
-                    await on_progress(self._tool_hint(response.tool_calls), tool_hint=True)
+                        await on_progress(f"[模型推理] {thought}")
+                    hint = self._tool_hint(response.tool_calls)
+                    await on_progress(step_prefix + hint, tool_hint=True)
 
                 tool_call_dicts = [
                     {
@@ -255,14 +363,48 @@ class AgentLoop:
                     thinking_blocks=response.thinking_blocks,
                 )
 
-                for tool_call in response.tool_calls:
+                if on_progress:
+                    names = ", ".join(current_tool_names)
+                    await on_progress(step_prefix + f"正在执行: {names}…")
+
+                # Run all tool calls in parallel when multiple are returned (e.g. multiple summarize).
+                # Prevent rag_index loop: if model keeps calling rag_index, only run it once per turn.
+                _RAG_INDEX_ALREADY_RUN = (
+                    "rag_index was already executed this turn. Do not call again; proceed to the next step (e.g. message tool to send the digest)."
+                )
+
+                async def run_one_or_skip_dup_rag_index(tc: Any) -> str:
+                    if tc.name == "rag_index" and "rag_index" in tools_used:
+                        return _RAG_INDEX_ALREADY_RUN
+                    return await self.tools.execute(tc.name, tc.arguments)
+
+                tasks = [run_one_or_skip_dup_rag_index(tc) for tc in response.tool_calls]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                for tool_call, result in zip(response.tool_calls, results):
                     tools_used.append(tool_call.name)
-                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    skipped = tool_call.name == "rag_index" and result == _RAG_INDEX_ALREADY_RUN
+                    if skipped:
+                        logger.info("Tool call: {} (skipped — already run this turn)", tool_call.name)
+                    else:
+                        args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
+                        logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
+                        # 订正文件写入时打印内容预览，便于核对【可靠】/【待验证】与订正结论
+                        if tool_call.name == "write_file":
+                            args = tool_call.arguments or {}
+                            path = (args.get("path") or "").replace("\\", "/")
+                            if "corrected" in path:
+                                content = args.get("content") or ""
+                                preview = (content[:800] + "…") if len(content) > 800 else content
+                                logger.info("订正内容预览 (corrected): %s", preview.replace("\n", " "))
+                    if isinstance(result, BaseException):
+                        result = f"Error: {result}"
                     messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
+                        messages, tool_call.id, tool_call.name, result, max_tokens=self.max_tokens
                     )
+
+                if on_progress:
+                    await on_progress("正在生成回复…")
             else:
                 clean = self._strip_think(response.content)
                 # Don't persist error responses to session history — they can
@@ -278,10 +420,10 @@ class AgentLoop:
                 final_content = clean
                 break
 
-        if final_content is None and iteration >= self.max_iterations:
-            logger.warning("Max iterations ({}) reached", self.max_iterations)
+        if final_content is None and iteration >= max_iter:
+            logger.warning("Max iterations ({}) reached", max_iter)
             final_content = (
-                f"I reached the maximum number of tool call iterations ({self.max_iterations}) "
+                f"I reached the maximum number of tool call iterations ({max_iter}) "
                 "without completing the task. You can try breaking the task into smaller steps."
             )
 
@@ -373,12 +515,23 @@ class AgentLoop:
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
+            await self._connect_mcp()
             history = session.get_history(max_messages=self.memory_window)
+            skill_names = ["agent-frontier"] if self._is_frontier_request(msg.content) else None
+            if skill_names:
+                logger.info("Injecting mandatory skill(s) into system prompt: {}", skill_names)
             messages = self.context.build_messages(
                 history=history,
-                current_message=msg.content, channel=channel, chat_id=chat_id,
+                current_message=msg.content,
+                skill_names=skill_names,
+                channel=channel,
+                chat_id=chat_id,
+                max_tokens=self.max_tokens,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(messages)
+            final_content, _, all_msgs = await self._run_agent_loop(
+                messages,
+                max_iterations_override=40 if self._is_likely_frontier_task(messages) else None,
+            )
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             return OutboundMessage(channel=channel, chat_id=chat_id,
@@ -447,24 +600,30 @@ class AgentLoop:
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
+        await self._connect_mcp()
         history = session.get_history(max_messages=self.memory_window)
+        skill_names = ["agent-frontier"] if self._is_frontier_request(msg.content) else None
+        if skill_names:
+            logger.info("Injecting mandatory skill(s) into system prompt: {}", skill_names)
         initial_messages = self.context.build_messages(
             history=history,
             current_message=msg.content,
+            skill_names=skill_names,
             media=msg.media if msg.media else None,
-            channel=msg.channel, chat_id=msg.chat_id,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            max_tokens=self.max_tokens,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
-            meta = dict(msg.metadata or {})
-            meta["_progress"] = True
-            meta["_tool_hint"] = tool_hint
-            await self.bus.publish_outbound(OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
-            ))
+            # Progress only to terminal (logger); do not send to Telegram — user gets only final response.
+            logger.info("Progress: {}", content)
 
+        is_frontier = self._is_likely_frontier_task(initial_messages)
         final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
+            initial_messages,
+            on_progress=on_progress or _bus_progress,
+            max_iterations_override=40 if is_frontier else None,
         )
 
         if final_content is None:
